@@ -1,0 +1,265 @@
+// GitHub Wrapped — Prisma schema
+// Ver ROADMAP.md secciones 9 y 35 para el razonamiento detrás de cada corrección.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────
+// Auth.js (Prisma adapter) — modelos estándar obligatorios
+// ─────────────────────────────────────────────────────────
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ─────────────────────────────────────────────────────────
+// Dominio de la aplicación
+// ─────────────────────────────────────────────────────────
+
+model User {
+  id        String   @id @default(cuid())
+  // name/email/emailVerified/image son los campos "estándar" que espera
+  // @auth/prisma-adapter por defecto (ver lib/auth/index.ts). githubId y
+  // username se rellenan aparte en el callback signIn a partir del profile
+  // de GitHub, ya que son específicos de nuestro dominio.
+  name          String?
+  email         String?  @unique
+  emailVerified DateTime?
+  image         String?
+  githubId      String?  @unique
+  username      String?  @unique
+  avatar        String?
+  // ⚠️ Corrección (sección 9/14.4): necesario para normalizar día/hora de
+  // actividad a la hora local del usuario en vez de UTC. IANA tz name.
+  timezone  String   @default("UTC")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts       Account[]
+  sessions       Session[]
+  githubAccount  GitHubAccount?
+  repositories   Repository[]
+  commits        Commit[]
+  languageStats  LanguageStat[]
+  wrappedReports WrappedReport[]
+  insights       Insight[]
+  syncState      SyncState?
+}
+
+// GitHub App/OAuth token storage.
+// ⚠️ accessToken / refreshToken deben cifrarse en la capa de aplicación
+// (ver lib/github/crypto.ts) antes de persistirse. NUNCA texto plano ni en logs.
+model GitHubAccount {
+  id           String    @id @default(cuid())
+  userId       String    @unique
+  accessToken  String    @db.Text // cifrado en reposo
+  refreshToken String?   @db.Text // cifrado en reposo
+  scope        String?
+  tokenType    String?
+  expiresAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Repository {
+  id          String   @id @default(cuid())
+  githubId    String   @unique
+  name        String
+  fullName    String
+  description String?
+  // MVP: solo se sincronizan repos con private = false (ver sección 5).
+  // El campo se mantiene para cuando el opt-in de repos privados exista.
+  private     Boolean  @default(false)
+  url         String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  userId  String
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  commits Commit[]
+  languageStats LanguageStat[]
+
+  @@index([userId])
+}
+
+model Commit {
+  id          String   @id @default(cuid())
+  sha         String
+  message     String   @db.Text
+  date        DateTime // timestamp original en UTC, tal como lo entrega GitHub
+  author      String
+  // ⚠️ Corrección (sección 11): usada para resolver identidad contra los
+  // emails verificados del usuario, no solo author.login.
+  authorEmail String?
+
+  repositoryId String
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([repositoryId, sha])
+  @@index([userId, date])
+}
+
+// ⚠️ Corrección (sección 9/26): serie de tiempo, no snapshot único.
+// Necesario para "Language Evolution" — comparar distribución en distintos momentos.
+model LanguageStat {
+  id         String   @id @default(cuid())
+  language   String
+  bytes      Int
+  percentage Float
+  capturedAt DateTime @default(now())
+
+  repositoryId String
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, capturedAt])
+  @@index([repositoryId, capturedAt])
+}
+
+model WrappedReport {
+  id                String   @id @default(cuid())
+  userId            String
+  periodStart       DateTime
+  periodEnd         DateTime
+  totalCommits      Int
+  totalRepositories Int
+  topLanguage       String?
+  topRepository     String?
+  mostActiveDay     String?
+  mostActiveHour    Int?
+  longestStreak     Int
+  isPublic          Boolean  @default(false)
+  createdAt         DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// Estado de sincronización — soporta Initial / Incremental sync (sección 12)
+// sin re-descargar todo cada vez.
+model SyncState {
+  id            String    @id @default(cuid())
+  userId        String    @unique
+  status        SyncStatus @default(IDLE)
+  progress      Int        @default(0) // 0-100, para el polling del frontend (sección 32)
+  lastSyncedAt  DateTime?
+  lastCursor    String?    // cursor GraphQL / paginación REST para incremental sync
+  errorMessage  String?    @db.Text
+  updatedAt     DateTime   @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+enum SyncStatus {
+  IDLE
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+// ─────────────────────────────────────────────────────────
+// Insights Engine (Fase 1 del roadmap de producto final)
+// ─────────────────────────────────────────────────────────
+
+// Un Insight es la salida del Insights Engine: un patrón detectado por el
+// Analytics Engine (puramente numérico) ya redactado en lenguaje natural.
+// ⚠️ No tiene FK a WrappedReport todavía — esa relación se agrega en la
+// fase de Wrapped Experience, cuando WrappedReport empiece a generarse de
+// verdad. Por ahora un Insight se identifica por usuario + período, lo
+// cual es suficiente para dashboard y para que Wrapped los reutilice
+// después por (userId, periodStart, periodEnd) en vez de duplicar lógica.
+model Insight {
+  id          String        @id @default(cuid())
+  userId      String
+  periodStart DateTime
+  periodEnd   DateTime
+  // Tipo de insight detectado (ver lib/insights/types.ts para el catálogo
+  // cerrado — se guarda como String, no enum, para poder agregar tipos
+  // nuevos sin migración, siempre que el código los reconozca).
+  type        String
+  // Usada para elegir qué insights mostrar primero (dashboard, Wrapped).
+  priority    Int
+  // Métricas estructuradas que originaron el insight — nunca se calculan
+  // aquí, vienen ya calculadas del Analytics Engine (sección 13/16).
+  data        Json
+  // Texto final mostrado al usuario — de IA o de plantilla determinista.
+  narrative   String        @db.Text
+  source      InsightSource @default(TEMPLATE)
+  createdAt   DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Un mismo tipo de insight no se duplica para el mismo usuario+período;
+  // regenerar reemplaza (upsert), no acumula filas.
+  @@unique([userId, periodStart, periodEnd, type])
+  @@index([userId, periodStart, periodEnd])
+}
+
+enum InsightSource {
+  TEMPLATE
+  AI
+}
+
+// Auditoría de costo/uso de IA (sección 16: "controlar costo en llamadas a
+// IA"). Independiente de Insight para poder loguear también llamadas que
+// fallaron o cayeron a fallback, sin ensuciar el modelo de dominio.
+model AiUsageLog {
+  id           String   @id @default(cuid())
+  userId       String
+  purpose      String   // "insight_narration", futuro: otros usos de IA
+  model        String
+  inputTokens  Int
+  outputTokens Int
+  succeeded    Boolean
+  fallbackUsed Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
